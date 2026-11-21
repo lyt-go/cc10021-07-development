@@ -3,6 +3,7 @@
 domain_chain: 质量基线 (dq_baseline)
   └─ 校验 → 指标监控 (metric_monitor)
   └─ 关联 → 字段画像 (column_profile)
+  └─ 待核 ← 冷启动检测记录 (anomaly_pattern)
 """
 
 from __future__ import annotations
@@ -24,6 +25,75 @@ class DqBaselineService(BaseModuleService):
     STATUS_ORDER = ["草稿", "待校验", "已生效", "已过期"]
     ACTION_RULES = {"提交校验": "待校验", "标记生效": "已生效", "标记过期": "已过期"}
     NEGATIVE_ACTIONS = []
+
+    # 基线待核清单存储表与冷启动检测记录来源表
+    REVIEW_TABLE = "dq_baseline_review"
+    COLDSTART_TABLE = "anomaly_coldstart"
+
+    def sync_coldstart_review(self) -> dict[str, Any]:
+        """同步冷启动检测结论到基线待核清单。
+
+        读取异常模式识别产出的冷启动检测记录，把待核结论按阈值口径和样本
+        条件登记为基线待核项，并保留单位与训练阶段。同一记录在同一训练
+        阶段只登记一次（重复同步只更新），阶段推进后另立新项，便于值班
+        人员对比统计够用前后的基线校验结论。
+        """
+        cold_rows = store.rows(self.COLDSTART_TABLE)
+        review_rows = store.rows(self.REVIEW_TABLE)
+        created: list[dict[str, Any]] = []
+        updated: list[dict[str, Any]] = []
+        now = datetime.now(timezone.utc).isoformat()
+
+        for rec in cold_rows:
+            if not rec.get("pending"):
+                continue
+            existing = next(
+                (r for r in review_rows
+                 if r.get("来源记录") == rec.get("记录编号")
+                 and r.get("训练阶段") == rec.get("训练阶段")),
+                None,
+            )
+            payload = {
+                "来源记录": rec.get("记录编号"),
+                "目标表名": rec.get("目标表名"),
+                "分区": rec.get("分区"),
+                "阈值口径": rec.get("阈值口径"),
+                "样本条件": f"{rec.get('样本数')}/{rec.get('最小样本数')}",
+                "样本数": rec.get("样本数"),
+                "最小样本数": rec.get("最小样本数"),
+                "样本是否充足": rec.get("样本是否充足"),
+                "单位": rec.get("单位"),
+                "训练阶段": rec.get("训练阶段"),
+                "是否分区模型": rec.get("是否分区模型"),
+                "结论": rec.get("结论"),
+                "越界样本数": rec.get("越界样本数"),
+                "同步时间": now,
+            }
+            if existing is not None:
+                existing.update(payload)
+                updated.append(existing)
+                continue
+            new_id = max((int(r.get("id", 0)) for r in review_rows), default=0) + 1
+            entry = {
+                "id": new_id,
+                "待核编号": f"RV-{new_id:04d}",
+                **payload,
+                "status": "待核",
+                "pending": True,
+                "abnormal": True,
+            }
+            review_rows.append(entry)
+            created.append(entry)
+
+        return {
+            "新增待核项": len(created),
+            "更新待核项": len(updated),
+            "待核项明细": created + updated,
+        }
+
+    def list_pending_reviews(self) -> list[dict[str, Any]]:
+        """列出基线待核清单中仍未办结的待核项。"""
+        return [r for r in store.rows(self.REVIEW_TABLE) if r.get("pending")]
 
     def calculate_baseline_from_history(self, table_name: str, metric_name: str,
                                          historical_values: list[float] | None = None) -> dict[str, Any]:

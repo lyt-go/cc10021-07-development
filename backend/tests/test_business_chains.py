@@ -187,6 +187,9 @@ class TestTrendScorecardPipeline:
 
     def test_analyze_incident_trend(self):
         svc = DqIncidentService()
+        # 先写入一条关联 ods_order_info 的事件，保证趋势分析有历史数据
+        # （此前依赖指标监控测试随机产生的事件，约有两成概率缺失导致用例不稳定）
+        svc.write_quality_incident("metric_monitor:ods_order_info.amount", "warning", "35%", "ods_order_info")
         trend = svc.analyze_incident_trend("ods_order_info")
         assert "趋势方向" in trend
         assert "修复率" in trend
@@ -351,6 +354,168 @@ class TestTemplatePipeline:
         svc = DqTemplateService()
         result = svc.instantiate_template(1, {"table": "ods_order_info", "column": "amount"})
         assert "实例化SQL" in result
+
+
+class TestColdStartBaselineChain:
+    """链路9: 稀疏分区冷启动校验→基线待核→统计够用后正式判定"""
+
+    TABLE = "ods_sparse_part"
+
+    def _validate(self, svc, samples, partition):
+        return svc.validate_sparse_partition_samples(
+            pattern_id=1,
+            table_name=self.TABLE,
+            partition=partition,
+            samples=samples,
+            table_upper=12000.0,
+            table_lower=4000.0,
+            unit="rows",
+            min_samples=6,
+        )
+
+    def test_sparse_partition_coldstart_record(self):
+        """同一分区只有两个新样本，一个高于表级历史阈值 → 产出待复核的冷启动记录。"""
+        svc = AnomalyPatternService()
+        result = self._validate(svc, [9800.0, 13500.0], partition="dt=2026-11-19")
+        assert result["状态"] == "成功"
+        record = result["冷启动记录"]
+        # 样本不足：只能引用表级历史阈值（稳定时段）作临时阈值
+        assert record["样本数"] == 2
+        assert record["样本是否充足"] is False
+        assert record["训练阶段"] == "冷启动-临时阈值"
+        assert record["阈值口径"] == "表级历史阈值(稳定时段)"
+        # 越界样本进入待基线复核结论，供值班人员判断是否进异常处置
+        assert record["越界样本数"] == 1
+        assert "待基线复核" in record["结论"]
+        # 原始证据保留在记录里
+        assert [s["值"] for s in record["原始样本"]] == [9800.0, 13500.0]
+        assert all(s["标签"] == "临时" for s in record["原始样本"])
+        assert record["单位"] == "rows"
+
+    def test_temporary_threshold_not_masquerade_as_partition_model(self):
+        """样本还不够时，临时阈值不得冒充已经计算过的分区模型。"""
+        svc = AnomalyPatternService()
+        pattern = store.find("anomaly_pattern", 1)
+        version_before = pattern.get("模式版本")
+        trained_before = pattern.get("最后训练")
+        status_before = pattern.get("status")
+
+        result = self._validate(svc, [9700.0, 13600.0], partition="dt=2026-11-20")
+        record = result["冷启动记录"]
+        # 记录显式声明自己不是分区模型
+        assert record["是否分区模型"] is False
+        assert record["训练阶段"] != "统计够用-分区模型"
+        # 模式本身也未被推进为已训练
+        assert pattern.get("模式版本") == version_before
+        assert pattern.get("最后训练") == trained_before
+        assert pattern.get("status") == status_before
+
+    def test_training_retry_excludes_temporary_labels(self):
+        """训练失败后重试，临时标签不能作为真实观测值回流到训练集。"""
+        svc = AnomalyPatternService()
+        result = self._validate(svc, [9800.0, 13500.0], partition="dt=2026-11-21")
+        record = result["冷启动记录"]
+        pattern = store.find("anomaly_pattern", 1)
+        version_before = pattern.get("模式版本")
+
+        # 首次训练：候选池只有临时标签样本 → 失败，且不得改动模式
+        first = svc.train_anomaly_pattern(1, "7d", candidate_samples=record["原始样本"])
+        assert first["训练结果"] == "失败"
+        assert first["有效观测样本数"] == 0
+        assert first["剔除临时标签样本数"] == 2
+        assert pattern.get("模式版本") == version_before
+
+        # 重试：补入真实观测样本，临时标签仍不得回流训练集
+        observed = [{"值": 10000.0 + i * 50, "标签": "观测"} for i in range(12)]
+        retry = svc.train_anomaly_pattern(
+            1, "7d", candidate_samples=record["原始样本"] + observed)
+        assert retry["训练结果"] == "成功"
+        assert retry["剔除临时标签样本数"] == 2
+        assert retry["模型参数"]["清洗前样本数"] == 12
+        # 训练集只含真实观测：统计量与临时样本（9800/13500）无关
+        assert retry["模型参数"]["均值"] == pytest.approx(10275.0)
+        assert retry["模型参数"]["上界(3sigma)"] < 13500.0
+
+    def test_sync_baseline_pending_review(self):
+        """训练校验的结论同步到基线待核清单，保留阈值口径、样本条件、单位与训练阶段。"""
+        svc = AnomalyPatternService()
+        baseline_svc = DqBaselineService()
+        result = self._validate(svc, [9800.0, 13500.0], partition="dt=2026-11-22")
+        record_no = result["记录编号"]
+
+        sync = baseline_svc.sync_coldstart_review()
+        entries = [e for e in sync["待核项明细"] if e["来源记录"] == record_no]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["阈值口径"] == "表级历史阈值(稳定时段)"
+        assert entry["样本条件"] == "2/6"
+        assert entry["样本是否充足"] is False
+        assert entry["单位"] == "rows"
+        assert entry["训练阶段"] == "冷启动-临时阈值"
+        assert entry["status"] == "待核"
+
+        # 同一记录同一训练阶段重复同步不重复登记
+        again = baseline_svc.sync_coldstart_review()
+        assert again["新增待核项"] == 0
+        remaining = [e for e in baseline_svc.list_pending_reviews() if e["来源记录"] == record_no]
+        assert len(remaining) == 1
+
+    def test_continuous_ingest_compare_before_after(self):
+        """稀疏分区连续补样：对比统计够用前后的基线校验结果与派发事件，核对临时阶段证据。"""
+        svc = AnomalyPatternService()
+        baseline_svc = DqBaselineService()
+        partition = "dt=2026-11-23"
+        incidents = store.rows("dq_incident")
+
+        # 统计够用前：两个新样本，一个高于表级历史阈值
+        before = self._validate(svc, [9800.0, 13500.0], partition=partition)
+        record_no = before["记录编号"]
+        assert before["训练阶段"] == "冷启动-临时阈值"
+        info_events = [e for e in incidents
+                       if e.get("关联规则") == f"coldstart:{record_no}"]
+        assert len(info_events) == 1
+        assert info_events[0]["严重级别"] == "info"
+        assert info_events[0]["处理状态"] == "冷启动待核"
+
+        baseline_svc.sync_coldstart_review()
+        reviews_before = [e for e in baseline_svc.list_pending_reviews()
+                          if e["来源记录"] == record_no]
+        assert [e["训练阶段"] for e in reviews_before] == ["冷启动-临时阈值"]
+
+        # 连续补入样本直到统计够用
+        warning_before = len([e for e in incidents if e.get("严重级别") == "warning"])
+        after = self._validate(svc, [10000.0, 10050.0, 9950.0, 10100.0], partition=partition)
+        record = after["冷启动记录"]
+        assert after["训练阶段"] == "统计够用-分区模型"
+        assert record["是否分区模型"] is True
+        assert record["阈值口径"] == "分区统计模型(3σ)"
+        assert record["样本是否充足"] is True
+        # 分区模型仍判定越界 → 派发正式异常事件
+        assert after["结论"] == "分区模型判定-异常"
+        warning_events = [e for e in incidents if e.get("严重级别") == "warning"]
+        assert len(warning_events) == warning_before + 1
+        assert warning_events[-1]["处理状态"] == "自动检测"
+        assert warning_events[-1]["关联规则"] == f"anomaly:{record['模式编号']}"
+
+        # 统计够用后的基线待核项与之前并存，可按阶段对比
+        baseline_svc.sync_coldstart_review()
+        reviews = [e for e in baseline_svc.list_pending_reviews()
+                   if e["来源记录"] == record_no]
+        assert sorted(e["训练阶段"] for e in reviews) == ["冷启动-临时阈值", "统计够用-分区模型"]
+        calibers = {e["训练阶段"]: e["阈值口径"] for e in reviews}
+        assert calibers["冷启动-临时阈值"] == "表级历史阈值(稳定时段)"
+        assert calibers["统计够用-分区模型"] == "分区统计模型(3σ)"
+        assert all(e["单位"] == "rows" for e in reviews)
+        after_entry = next(e for e in reviews if e["训练阶段"] == "统计够用-分区模型")
+        assert after_entry["样本是否充足"] is True
+        assert after_entry["结论"] == "分区模型判定-异常"
+
+        # 临时阶段的原始证据仍然留存
+        history = record["阶段历史"]
+        assert history[0]["阶段"] == "冷启动-临时阈值"
+        assert history[0]["样本快照"] == [9800.0, 13500.0]
+        assert [s["标签"] for s in record["原始样本"][:2]] == ["临时", "临时"]
+        assert [s["标签"] for s in record["原始样本"][2:]] == ["观测"] * 4
 
 
 class TestDomainSnapshot:
